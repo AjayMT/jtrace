@@ -4,15 +4,52 @@
 #include <unordered_map>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 #include <jvmti.h>
 
 static jvmtiEnv *global_jvmti = NULL;
-static int global_jvm_started = 0;
+static bool global_jvm_started = false;
 static const std::vector<std::string> global_java_prefixes = {
   "Ljava/",
   "Ljdk/",
   "Lsun/"
 };
+
+struct java_value
+{
+  enum java_type
+  {
+    INT,
+    LONG,
+    DOUBLE,
+    FLOAT,
+    OBJECT
+  };
+  union _value
+  {
+    jobject _object;
+    jint _int;
+    jlong _long;
+    jdouble _double;
+    jfloat _float;
+  };
+
+  java_type type;
+  _value value;
+};
+
+typedef std::unordered_map<std::string, java_value> state_map;
+
+struct single_step
+{
+  std::string class_name;
+  std::string method_name;
+  state_map class_state;
+  state_map instance_state;
+  state_map local_state;
+};
+
+static std::vector<single_step> global_program_steps;
 
 void check_jvmti_error(
   jvmtiEnv *jvmti,
@@ -32,7 +69,35 @@ void check_jvmti_error(
     << std::endl;
 }
 
-void JNICALL cbSingleStep(
+java_value get_local_variable(
+  jvmtiEnv *jvmti, jthread thread, int depth, int slot, std::string signature
+  )
+{
+  jvmtiError error;
+  java_value value;
+  java_value::java_type type;
+
+#define GET_LOCAL_VARIABLE(method, member) {                            \
+    error = (method)(thread, depth, slot, &(value.value.member));       \
+    if (error != JVMTI_ERROR_INVALID_SLOT)                              \
+      check_jvmti_error(jvmti, error, "unable to get local variable");  \
+    value.type = type;                                                  \
+  }
+
+  // TODO handle all types
+
+  if (signature == "I") {
+    type = java_value::INT;
+    GET_LOCAL_VARIABLE(jvmti->GetLocalInt, _int);
+  } else {
+    type = java_value::OBJECT;
+    GET_LOCAL_VARIABLE(jvmti->GetLocalObject, _object);
+  }
+
+  return value;
+}
+
+void JNICALL cb_single_step(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
   jthread thread,
@@ -42,7 +107,7 @@ void JNICALL cbSingleStep(
 {
   if (!global_jvm_started) return;
 
-  static std::unordered_map<jmethodID, bool> method_classes;
+  static std::unordered_map<jmethodID, std::string> method_classes;
   jvmtiError error;
 
   if (method_classes.count(method) == 0) {
@@ -55,43 +120,57 @@ void JNICALL cbSingleStep(
     error = jvmti->GetClassSignature(klass, &_class_signature, &_class_generic);
     check_jvmti_error(jvmti, error, "unable to get signature");
 
-    method_classes[method] = true;
+    method_classes[method] = std::string(_class_signature);
     std::string class_signature(_class_signature);
-    for (const auto& prefix : global_java_prefixes) {
-      const auto cmp_substr = class_signature.substr(0, prefix.size());
-      if (cmp_substr == prefix) {
-        method_classes[method] = false;
-        break;
-      }
-    }
   }
 
-  if (!method_classes[method]) return;
+  std::string class_signature(method_classes[method]);
+  for (const auto& prefix : global_java_prefixes) {
+    const auto cmp_substr = class_signature.substr(0, prefix.size());
+    if (cmp_substr == prefix) return;
+  }
+
+  single_step current_step;
+  current_step.class_name = class_signature;
 
   char *_method_name = NULL;
   char *_method_signature = NULL;
   char *_method_generic = NULL;
-  error = jvmti->GetMethodName(method, &_method_name, &_method_signature, &_method_generic);
+  error = jvmti->GetMethodName(
+    method, &_method_name, &_method_signature, &_method_generic
+    );
   check_jvmti_error(jvmti, error, "unable to get method name");
+  if (_method_name != NULL) current_step.method_name = _method_name;
 
   jvmtiLocalVariableEntry *_var_table = NULL;
   jint _var_entry_count;
   error = jvmti->GetLocalVariableTable(method, &_var_entry_count, &_var_table);
   check_jvmti_error(jvmti, error, "unable to get local variable table");
 
-  std::string method_name(_method_name);
-  std::vector<jvmtiLocalVariableEntry> local_vars(_var_table, _var_table + _var_entry_count);
-
-  std::cout << "method name: " << method_name << std::endl;
+  std::vector<jvmtiLocalVariableEntry> local_vars(
+    _var_table, _var_table + _var_entry_count
+    );
   for (const auto& var : local_vars) {
-    std::cout << "  local variable: " << var.name << std::endl;
+    std::string var_signature(var.signature);
+    java_value var_value = get_local_variable(
+      jvmti, thread, 0, var.slot, var_signature
+      );
+    current_step.local_state[std::string(var.name)] = var_value;
   }
+
+  global_program_steps.push_back(current_step);
 }
 
-void JNICALL cbVMStart(jvmtiEnv *jvmti, JNIEnv *jni)
+void JNICALL cb_vm_start(jvmtiEnv *jvmti, JNIEnv *jni)
 {
-  std::cout << "VM started" << std::endl;
-  global_jvm_started = 1;
+  std::cerr << "VM started" << std::endl;
+  global_jvm_started = true;
+}
+
+void JNICALL cb_vm_death(jvmtiEnv *jvmti, JNIEnv *jni)
+{
+  std::cerr << "VM died" << std::endl;
+  std::cerr << global_program_steps.size() << " steps" << std::endl;
 }
 
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
@@ -117,8 +196,9 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   jvmtiEventCallbacks callbacks;
   std::memset(&callbacks, 0, sizeof(callbacks));
 
-  callbacks.SingleStep = cbSingleStep;
-  callbacks.VMStart = cbVMStart;
+  callbacks.SingleStep = cb_single_step;
+  callbacks.VMStart = cb_vm_start;
+  callbacks.VMDeath = cb_vm_death;
 
   error = global_jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
   check_jvmti_error(global_jvmti, error, "unable to set event callbacks");
@@ -129,6 +209,10 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   check_jvmti_error(global_jvmti, error, "unable to set event notification");
   error = global_jvmti->SetEventNotificationMode(
     JVMTI_ENABLE, JVMTI_EVENT_VM_START, (jthread) NULL
+    );
+  check_jvmti_error(global_jvmti, error, "unable to set event notification");
+  error = global_jvmti->SetEventNotificationMode(
+    JVMTI_ENABLE, JVMTI_EVENT_VM_DEATH, (jthread) NULL
     );
   check_jvmti_error(global_jvmti, error, "unable to set event notification");
 
