@@ -48,7 +48,8 @@ struct java_value
 
   java_type type;
   _value value;
-  java_value () : type(INT) { std::memset(&value, 0, sizeof(value)); }
+  std::string signature;
+  java_value() : type(INT) { std::memset(&value, 0, sizeof(value)); }
 };
 
 typedef std::unordered_map<std::string, java_value> state_map;
@@ -82,6 +83,8 @@ bool operator==(const single_step& left, const single_step& right)
       const java_value& right_val = right.map.at(var.first);    \
       if (var.second.type != right_val.type)                    \
         return false;                                           \
+      if (var.second.signature != right_val.signature)          \
+        return false;                                           \
       if (var.second.value._object != right_val.value._object)  \
         return false;                                           \
     }                                                           \
@@ -110,6 +113,7 @@ void check_jvmti_error(
     << (errnum_str == NULL ? "Unknown" : errnum_str) << "): "
     << (str == NULL ? "" : str)
     << std::endl;
+  jvmti->Deallocate((unsigned char *)errnum_str);
 }
 
 void write_state(std::ostringstream& output, std::string prefix, state_map map)
@@ -117,7 +121,11 @@ void write_state(std::ostringstream& output, std::string prefix, state_map map)
   for (const auto& var : map) {
     output
       << prefix << "."
-      << "\"" << var.first << "\" = ";
+      << "\"" << var.first << "\".signature = "
+      << "\"" << var.second.signature << "\""
+      << std::endl
+      << prefix << "."
+      << "\"" << var.first << "\".value = ";
     switch (var.second.type) {
     case java_value::INT: output << var.second.value._int; break;
     case java_value::SHORT: output << var.second.value._short; break;
@@ -161,32 +169,32 @@ void write_toml()
   } else std::cout << output.str();
 }
 
-java_value get_local_variable(
-  jvmtiEnv *jvmti, jthread thread, int depth, int slot, std::string signature
+bool get_local_variable(
+  jvmtiEnv *jvmti, jthread thread, int depth, int slot, java_value& value
   )
 {
   jvmtiError error;
-  java_value value;
   java_value::java_type type;
 
 #define GET_LOCAL_VARIABLE(method, member) {                            \
     error = (method)(thread, depth, slot, &(value.value.member));       \
-    if (error != JVMTI_ERROR_INVALID_SLOT)                              \
-      check_jvmti_error(jvmti, error, "unable to get local variable");  \
+    if (error == JVMTI_ERROR_INVALID_SLOT)                              \
+      return false;                                                     \
+    check_jvmti_error(jvmti, error, "unable to get local variable");    \
     value.type = type;                                                  \
   }
 
   // yuck
-  if (signature == "I") {
+  if (value.signature == "I") {
     type = java_value::INT;
     GET_LOCAL_VARIABLE(jvmti->GetLocalInt, _int);
-  } else if (signature == "J") {
+  } else if (value.signature == "J") {
     type = java_value::LONG;
     GET_LOCAL_VARIABLE(jvmti->GetLocalLong, _long);
-  } else if (signature == "F") {
+  } else if (value.signature == "F") {
     type = java_value::FLOAT;
     GET_LOCAL_VARIABLE(jvmti->GetLocalFloat, _float);
-  } else if (signature == "D") {
+  } else if (value.signature == "D") {
     type = java_value::DOUBLE;
     GET_LOCAL_VARIABLE(jvmti->GetLocalDouble, _double);
   } else {
@@ -194,7 +202,7 @@ java_value get_local_variable(
     GET_LOCAL_VARIABLE(jvmti->GetLocalObject, _object);
   }
 
-  return value;
+  return true;
 }
 
 void read_field(
@@ -217,6 +225,8 @@ void read_field(
   check_jvmti_error(jvmti, error, "unable to get class field");
   std::string field_name(_field_name);
   std::string field_signature(_field_signature);
+  jvmti->Deallocate((unsigned char *)_field_name);
+  jvmti->Deallocate((unsigned char *)_field_signature);
 
   jint _field_modifiers = 0;
   error = jvmti->GetFieldModifiers(klass, field, &_field_modifiers);
@@ -230,6 +240,7 @@ void read_field(
   java_value field_value;
   java_value::java_type type;
   jobject _obj = is_instance ? step.local_state["this"].value._object : 0;
+  field_value.signature = field_signature;
 
 #define READ_FIELD(s_method, i_method, member) {                        \
     if (is_static) field_value.value.member = (s_method)(klass, field); \
@@ -299,6 +310,8 @@ void JNICALL cb_single_step(
     error = jvmti->GetClassSignature(klass, &_class_signature, &_class_generic);
     check_jvmti_error(jvmti, error, "unable to get signature");
     method_classes[method] = _class_signature;
+    jvmti->Deallocate((unsigned char *)_class_signature);
+    jvmti->Deallocate((unsigned char *)_class_generic);
   }
 
   std::string class_signature(method_classes[method]);
@@ -316,6 +329,9 @@ void JNICALL cb_single_step(
       );
     check_jvmti_error(jvmti, error, "unable to get method name");
     method_names[method] = _method_name;
+    jvmti->Deallocate((unsigned char *)_method_name);
+    jvmti->Deallocate((unsigned char *)_method_signature);
+    jvmti->Deallocate((unsigned char *)_method_generic);
   }
 
   if (method_local_variables.count(method) == 0) {
@@ -326,6 +342,7 @@ void JNICALL cb_single_step(
     method_local_variables[method].assign(
       _var_table, _var_table + _var_entry_count
       );
+    jvmti->Deallocate((unsigned char *)_var_table);
   }
 
   single_step current_step;
@@ -333,11 +350,13 @@ void JNICALL cb_single_step(
   current_step.method_name = method_names[method];
 
   for (const auto& var : method_local_variables[method]) {
-    std::string var_signature(var.signature);
-    java_value var_value = get_local_variable(
-      jvmti, thread, 0, var.slot, var_signature
+    java_value var_value;
+    var_value.signature = var.signature;
+    bool exists = get_local_variable(
+      jvmti, thread, 0, var.slot, var_value
       );
-    current_step.local_state[std::string(var.name)] = var_value;
+    if (exists)
+      current_step.local_state[std::string(var.name)] = var_value;
   }
 
   if (current_step.local_state.count("this")) {
@@ -352,10 +371,11 @@ void JNICALL cb_single_step(
   jint _field_entry_count;
   error = jvmti->GetClassFields(klass, &_field_entry_count, &_field_table);
   check_jvmti_error(jvmti, error, "unable to get class field");
-
   std::vector<jfieldID> class_fields(
     _field_table, _field_table + _field_entry_count
     );
+  jvmti->Deallocate((unsigned char *)_field_table);
+
   for (const auto& field : class_fields)
     read_field(jvmti, jni, current_step, klass, field);
 
