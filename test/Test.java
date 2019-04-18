@@ -16,7 +16,14 @@ public class Test {
         int f = 12;
         int local = 42;
         staticState = !staticState;
+
         MyClass myObject = new MyClass();
         myObject.printSelf();
+
+        if (true) {
+            String a = "A";
+            System.out.println(a);
+            myObject = null;
+        }
     }
 }

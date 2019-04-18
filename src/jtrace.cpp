@@ -64,6 +64,36 @@ struct single_step
 
 static std::vector<single_step> global_program_steps;
 
+bool operator==(const single_step& left, const single_step& right)
+{
+  if (left.class_name != right.class_name) return false;
+  if (left.method_name != right.method_name) return false;
+  if (left.class_state.size() != right.class_state.size())
+    return false;
+  if (left.instance_state.size() != right.instance_state.size())
+    return false;
+  if (left.local_state.size() != right.local_state.size())
+    return false;
+
+#define COMPARE_MAP(map) {                                      \
+    for (const auto& var : left.map) {                          \
+      if (right.map.count(var.first) == 0)                      \
+        return false;                                           \
+      const java_value& right_val = right.map.at(var.first);    \
+      if (var.second.type != right_val.type)                    \
+        return false;                                           \
+      if (var.second.value._object != right_val.value._object)  \
+        return false;                                           \
+    }                                                           \
+  }
+
+  COMPARE_MAP(class_state);
+  COMPARE_MAP(instance_state);
+  COMPARE_MAP(local_state);
+
+  return true;
+}
+
 void check_jvmti_error(
   jvmtiEnv *jvmti,
   jvmtiError errnum,
@@ -252,6 +282,11 @@ void JNICALL cb_single_step(
   if (!global_jvm_started) return;
 
   static std::unordered_map<jmethodID, std::string> method_classes;
+  static std::unordered_map<jmethodID, std::string> method_names;
+  static std::unordered_map<
+    jmethodID,
+    std::vector<jvmtiLocalVariableEntry>
+    > method_local_variables;
   jvmtiError error;
 
   jclass klass;
@@ -263,9 +298,7 @@ void JNICALL cb_single_step(
     char *_class_generic = NULL;
     error = jvmti->GetClassSignature(klass, &_class_signature, &_class_generic);
     check_jvmti_error(jvmti, error, "unable to get signature");
-
-    method_classes[method] = std::string(_class_signature);
-    std::string class_signature(_class_signature);
+    method_classes[method] = _class_signature;
   }
 
   std::string class_signature(method_classes[method]);
@@ -274,32 +307,45 @@ void JNICALL cb_single_step(
     if (cmp_substr == prefix) return;
   }
 
+  if (method_names.count(method) == 0) {
+    char *_method_name = NULL;
+    char *_method_signature = NULL;
+    char *_method_generic = NULL;
+    error = jvmti->GetMethodName(
+      method, &_method_name, &_method_signature, &_method_generic
+      );
+    check_jvmti_error(jvmti, error, "unable to get method name");
+    method_names[method] = _method_name;
+  }
+
+  if (method_local_variables.count(method) == 0) {
+    jvmtiLocalVariableEntry *_var_table = NULL;
+    jint _var_entry_count;
+    error = jvmti->GetLocalVariableTable(method, &_var_entry_count, &_var_table);
+    check_jvmti_error(jvmti, error, "unable to get local variable table");
+    method_local_variables[method].assign(
+      _var_table, _var_table + _var_entry_count
+      );
+  }
+
   single_step current_step;
   current_step.class_name = class_signature;
+  current_step.method_name = method_names[method];
 
-  char *_method_name = NULL;
-  char *_method_signature = NULL;
-  char *_method_generic = NULL;
-  error = jvmti->GetMethodName(
-    method, &_method_name, &_method_signature, &_method_generic
-    );
-  check_jvmti_error(jvmti, error, "unable to get method name");
-  if (_method_name != NULL) current_step.method_name = _method_name;
-
-  jvmtiLocalVariableEntry *_var_table = NULL;
-  jint _var_entry_count;
-  error = jvmti->GetLocalVariableTable(method, &_var_entry_count, &_var_table);
-  check_jvmti_error(jvmti, error, "unable to get local variable table");
-
-  std::vector<jvmtiLocalVariableEntry> local_vars(
-    _var_table, _var_table + _var_entry_count
-    );
-  for (const auto& var : local_vars) {
+  for (const auto& var : method_local_variables[method]) {
     std::string var_signature(var.signature);
     java_value var_value = get_local_variable(
       jvmti, thread, 0, var.slot, var_signature
       );
     current_step.local_state[std::string(var.name)] = var_value;
+  }
+
+  if (current_step.local_state.count("this")) {
+    // 'this' does not behave like other local variables
+    jobject _this = 0;
+    error = jvmti->GetLocalInstance(thread, 0, &_this);
+    check_jvmti_error(jvmti, error, "unable to get local instance");
+    current_step.local_state["this"].value._object = _this;
   }
 
   jfieldID *_field_table = NULL;
@@ -313,6 +359,10 @@ void JNICALL cb_single_step(
   for (const auto& field : class_fields)
     read_field(jvmti, jni, current_step, klass, field);
 
+  if (
+    global_program_steps.size() > 0
+    && global_program_steps.back() == current_step
+    ) return;
   global_program_steps.push_back(current_step);
 }
 
