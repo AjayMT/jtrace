@@ -1,10 +1,13 @@
 
 #include <iostream>
+#include <sstream>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <jvmti.h>
 
 static jvmtiEnv *global_jvmti = NULL;
@@ -69,6 +72,44 @@ void check_jvmti_error(
     << std::endl;
 }
 
+void write_toml()
+{
+  std::ostringstream output;
+
+  for (int i = 0; i < global_program_steps.size(); ++i) {
+    const single_step& step = global_program_steps[i];
+    output
+      << "["
+      << "step" << i << "."
+      << "\"" << step.class_name << "\"."
+      << "\"" << step.method_name << "\""
+      << "]"
+      << std::endl;
+
+    for (const auto& var : step.local_state) {
+      output
+        << "local."
+        << "\"" << var.first << "\" = ";
+      switch (var.second.type) {
+      case java_value::INT: output << var.second.value._int; break;
+      case java_value::LONG: output << var.second.value._long; break;
+      case java_value::DOUBLE: output << var.second.value._double; break;
+      case java_value::FLOAT: output << var.second.value._float; break;
+      default: output << var.second.value._object;
+      }
+      output << std::endl;
+    }
+  }
+
+  if (std::getenv("JTRACE_OUT") != NULL) {
+    std::string filename(std::getenv("JTRACE_OUT"));
+    std::ofstream file;
+    file.open(filename);
+    file << output.str();
+    file.close();
+  } else std::cout << output.str();
+}
+
 java_value get_local_variable(
   jvmtiEnv *jvmti, jthread thread, int depth, int slot, std::string signature
   )
@@ -84,11 +125,19 @@ java_value get_local_variable(
     value.type = type;                                                  \
   }
 
-  // TODO handle all types
-
+  // yuck
   if (signature == "I") {
     type = java_value::INT;
     GET_LOCAL_VARIABLE(jvmti->GetLocalInt, _int);
+  } else if (signature == "L") {
+    type = java_value::LONG;
+    GET_LOCAL_VARIABLE(jvmti->GetLocalLong, _long);
+  } else if (signature == "F") {
+    type = java_value::FLOAT;
+    GET_LOCAL_VARIABLE(jvmti->GetLocalFloat, _float);
+  } else if (signature == "D") {
+    type = java_value::DOUBLE;
+    GET_LOCAL_VARIABLE(jvmti->GetLocalDouble, _double);
   } else {
     type = java_value::OBJECT;
     GET_LOCAL_VARIABLE(jvmti->GetLocalObject, _object);
@@ -170,7 +219,7 @@ void JNICALL cb_vm_start(jvmtiEnv *jvmti, JNIEnv *jni)
 void JNICALL cb_vm_death(jvmtiEnv *jvmti, JNIEnv *jni)
 {
   std::cerr << "VM died" << std::endl;
-  std::cerr << global_program_steps.size() << " steps" << std::endl;
+  write_toml();
 }
 
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)

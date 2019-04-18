@@ -6,4 +6,4 @@ jtrace: src/jtrace.cpp
 
 .PHONY: clean
 clean:
-	rm -f jtrace
+	rm -f jtrace test/*.class
