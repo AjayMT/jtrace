@@ -137,7 +137,7 @@ void write_toml()
 {
   std::ostringstream output;
 
-  for (int i = 0; i < global_program_steps.size(); ++i) {
+  for (unsigned int i = 0; i < global_program_steps.size(); ++i) {
     const single_step& step = global_program_steps[i];
     output
       << "["
