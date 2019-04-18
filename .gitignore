@@ -2,3 +2,4 @@ jtrace.dylib
 test/*.class
 /jtrace
 /node_modules/
+*.toml

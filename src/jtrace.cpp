@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <jvmti.h>
+#include <jni.h>
 
 static jvmtiEnv *global_jvmti = NULL;
 static bool global_jvm_started = false;
@@ -26,12 +27,20 @@ struct java_value
     LONG,
     DOUBLE,
     FLOAT,
+    SHORT,
+    CHAR,
+    BYTE,
+    BOOLEAN,
     OBJECT
   };
   union _value
   {
     jobject _object;
     jint _int;
+    jshort _short;
+    jchar _char;
+    jboolean _boolean;
+    jbyte _byte;
     jlong _long;
     jdouble _double;
     jfloat _float;
@@ -39,6 +48,7 @@ struct java_value
 
   java_type type;
   _value value;
+  java_value () : type(INT) { std::memset(&value, 0, sizeof(value)); }
 };
 
 typedef std::unordered_map<std::string, java_value> state_map;
@@ -72,6 +82,27 @@ void check_jvmti_error(
     << std::endl;
 }
 
+void write_state(std::ostringstream& output, std::string prefix, state_map map)
+{
+  for (const auto& var : map) {
+    output
+      << prefix << "."
+      << "\"" << var.first << "\" = ";
+    switch (var.second.type) {
+    case java_value::INT: output << var.second.value._int; break;
+    case java_value::SHORT: output << var.second.value._short; break;
+    case java_value::LONG: output << var.second.value._long; break;
+    case java_value::DOUBLE: output << var.second.value._double; break;
+    case java_value::FLOAT: output << var.second.value._float; break;
+    case java_value::BOOLEAN: output << var.second.value._int; break; //
+    case java_value::BYTE: output << var.second.value._byte; break;
+    case java_value::CHAR: output << var.second.value._char; break;
+    default: output << var.second.value._object;
+    }
+    output << std::endl;
+  }
+}
+
 void write_toml()
 {
   std::ostringstream output;
@@ -86,19 +117,9 @@ void write_toml()
       << "]"
       << std::endl;
 
-    for (const auto& var : step.local_state) {
-      output
-        << "local."
-        << "\"" << var.first << "\" = ";
-      switch (var.second.type) {
-      case java_value::INT: output << var.second.value._int; break;
-      case java_value::LONG: output << var.second.value._long; break;
-      case java_value::DOUBLE: output << var.second.value._double; break;
-      case java_value::FLOAT: output << var.second.value._float; break;
-      default: output << var.second.value._object;
-      }
-      output << std::endl;
-    }
+    write_state(output, "local", step.local_state);
+    write_state(output, "instance", step.instance_state);
+    write_state(output, "class", step.class_state);
   }
 
   if (std::getenv("JTRACE_OUT") != NULL) {
@@ -129,7 +150,7 @@ java_value get_local_variable(
   if (signature == "I") {
     type = java_value::INT;
     GET_LOCAL_VARIABLE(jvmti->GetLocalInt, _int);
-  } else if (signature == "L") {
+  } else if (signature == "J") {
     type = java_value::LONG;
     GET_LOCAL_VARIABLE(jvmti->GetLocalLong, _long);
   } else if (signature == "F") {
@@ -146,6 +167,80 @@ java_value get_local_variable(
   return value;
 }
 
+void read_field(
+  jvmtiEnv *jvmti,
+  JNIEnv *jni,
+  single_step& step,
+  jclass klass,
+  jfieldID field
+  )
+{
+  bool is_instance = step.local_state.count("this");
+  jvmtiError error;
+
+  char *_field_name = NULL;
+  char *_field_signature = NULL;
+  char *_field_generic = NULL;
+  error = jvmti->GetFieldName(
+    klass, field, &_field_name, &_field_signature, &_field_generic
+    );
+  check_jvmti_error(jvmti, error, "unable to get class field");
+  std::string field_name(_field_name);
+  std::string field_signature(_field_signature);
+
+  jint _field_modifiers = 0;
+  error = jvmti->GetFieldModifiers(klass, field, &_field_modifiers);
+  check_jvmti_error(jvmti, error, "unable to get field modifiers");
+
+#define FIELD_STATIC_MODIFIER 0x0008
+
+  bool is_static = _field_modifiers & FIELD_STATIC_MODIFIER;
+  if (!is_static && !is_instance) return;
+
+  java_value field_value;
+  java_value::java_type type;
+  jobject _obj = is_instance ? step.local_state["this"].value._object : 0;
+
+#define READ_FIELD(s_method, i_method, member) {                        \
+    if (is_static) field_value.value.member = (s_method)(klass, field); \
+    else field_value.value.member = (i_method)(_obj, field);            \
+    field_value.type = type;                                            \
+  }
+
+  // yuck
+  if (field_signature == "I") {
+    type = java_value::INT;
+    READ_FIELD(jni->GetStaticIntField, jni->GetIntField, _int);
+  } else if (field_signature == "J") {
+    type = java_value::LONG;
+    READ_FIELD(jni->GetStaticLongField, jni->GetLongField, _long);
+  } else if (field_signature == "F") {
+    type = java_value::FLOAT;
+    READ_FIELD(jni->GetStaticFloatField, jni->GetFloatField, _float);
+  } else if (field_signature == "D") {
+    type = java_value::DOUBLE;
+    READ_FIELD(jni->GetStaticDoubleField, jni->GetDoubleField, _double);
+  } else if (field_signature == "Z") {
+    type = java_value::BOOLEAN;
+    READ_FIELD(jni->GetStaticBooleanField, jni->GetBooleanField, _boolean);
+  } else if (field_signature == "B") {
+    type = java_value::BYTE;
+    READ_FIELD(jni->GetStaticByteField, jni->GetByteField, _byte);
+  } else if (field_signature == "C") {
+    type = java_value::CHAR;
+    READ_FIELD(jni->GetStaticCharField, jni->GetCharField, _char);
+  } else if (field_signature == "S") {
+    type = java_value::SHORT;
+    READ_FIELD(jni->GetStaticShortField, jni->GetShortField, _short);
+  } else {
+    type = java_value::OBJECT;
+    READ_FIELD(jni->GetStaticObjectField, jni->GetObjectField, _object);
+  }
+
+  if (is_instance) step.instance_state[field_name] = field_value;
+  else step.class_state[field_name] = field_value;
+}
+
 void JNICALL cb_single_step(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
@@ -159,11 +254,11 @@ void JNICALL cb_single_step(
   static std::unordered_map<jmethodID, std::string> method_classes;
   jvmtiError error;
 
-  if (method_classes.count(method) == 0) {
-    jclass klass;
-    error = jvmti->GetMethodDeclaringClass(method, &klass);
-    check_jvmti_error(jvmti, error, "unable to get class");
+  jclass klass;
+  error = jvmti->GetMethodDeclaringClass(method, &klass);
+  check_jvmti_error(jvmti, error, "unable to get class");
 
+  if (method_classes.count(method) == 0) {
     char *_class_signature = NULL;
     char *_class_generic = NULL;
     error = jvmti->GetClassSignature(klass, &_class_signature, &_class_generic);
@@ -206,6 +301,17 @@ void JNICALL cb_single_step(
       );
     current_step.local_state[std::string(var.name)] = var_value;
   }
+
+  jfieldID *_field_table = NULL;
+  jint _field_entry_count;
+  error = jvmti->GetClassFields(klass, &_field_entry_count, &_field_table);
+  check_jvmti_error(jvmti, error, "unable to get class field");
+
+  std::vector<jfieldID> class_fields(
+    _field_table, _field_table + _field_entry_count
+    );
+  for (const auto& field : class_fields)
+    read_field(jvmti, jni, current_step, klass, field);
 
   global_program_steps.push_back(current_step);
 }
