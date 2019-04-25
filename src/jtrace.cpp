@@ -11,13 +11,12 @@
 #include <jvmti.h>
 #include <jni.h>
 
-static jvmtiEnv *global_jvmti = NULL;
-static bool global_jvm_started = false;
 static const std::vector<std::string> global_java_prefixes = {
   "Ljava/",
   "Ljdk/",
   "Lsun/"
 };
+static const std::string global_jtrace_receiver = "JTraceReceiver;";
 
 struct java_value
 {
@@ -63,7 +62,16 @@ struct single_step
   state_map local_state;
 };
 
-static std::vector<single_step> global_program_steps;
+struct global_state
+{
+  bool jvm_started = false;
+  bool trace_on = false;
+  jvmtiEnv *jvmti = NULL;
+  jobject receiver = 0;
+  std::vector<single_step> program_steps;
+};
+
+static global_state global;
 
 bool operator==(const single_step& left, const single_step& right)
 {
@@ -116,7 +124,7 @@ void check_jvmti_error(
   jvmti->Deallocate((unsigned char *)errnum_str);
 }
 
-void write_state(std::ostringstream& output, std::string prefix, state_map map)
+void write_state(std::ostream& output, std::string prefix, state_map map)
 {
   for (const auto& var : map) {
     output
@@ -141,32 +149,32 @@ void write_state(std::ostringstream& output, std::string prefix, state_map map)
   }
 }
 
-void write_toml()
+void write_step(JNIEnv *jni, const single_step& step)
 {
+  if (global.receiver == 0) return;
+
   std::ostringstream output;
+  output
+    << "["
+    << "\"" << step.class_name << "\"."
+    << "\"" << step.method_name << "\""
+    << "]"
+    << std::endl;
+  write_state(output, "local", step.local_state);
+  write_state(output, "instance", step.instance_state);
+  write_state(output, "class", step.class_state);
 
-  for (unsigned int i = 0; i < global_program_steps.size(); ++i) {
-    const single_step& step = global_program_steps[i];
-    output
-      << "["
-      << "step" << i << "."
-      << "\"" << step.class_name << "\"."
-      << "\"" << step.method_name << "\""
-      << "]"
-      << std::endl;
+  std::string outstr = output.str();
+  jchar output_chars[outstr.size()];
+  for (int i = 0; i < outstr.size(); ++i)
+    output_chars[i] = (jchar)outstr[i];
+  jstring output_string = jni->NewString(output_chars, (jsize)outstr.size());
 
-    write_state(output, "local", step.local_state);
-    write_state(output, "instance", step.instance_state);
-    write_state(output, "class", step.class_state);
-  }
-
-  if (std::getenv("JTRACE_OUT") != NULL) {
-    std::string filename(std::getenv("JTRACE_OUT"));
-    std::ofstream file;
-    file.open(filename);
-    file << output.str();
-    file.close();
-  } else std::cout << output.str();
+  jclass receiver_class = jni->GetObjectClass(global.receiver);
+  const char *add_method_name = "add";
+  const char *add_method_signature = "(Ljava/lang/String;)V";
+  jmethodID add_method = jni->GetMethodID(receiver_class, add_method_name, add_method_signature);
+  jni->CallVoidMethod(global.receiver, add_method, output_string);
 }
 
 bool get_local_variable(
@@ -290,7 +298,7 @@ void JNICALL cb_single_step(
   jlocation location
   )
 {
-  if (!global_jvm_started) return;
+  if (!global.jvm_started) return;
 
   static std::unordered_map<jmethodID, std::string> method_classes;
   static std::unordered_map<jmethodID, std::string> method_names;
@@ -334,6 +342,26 @@ void JNICALL cb_single_step(
     jvmti->Deallocate((unsigned char *)_method_generic);
   }
 
+#define CHECK_RECEIVER(block) {                                     \
+    if (class_signature.size() >= global_jtrace_receiver.size()) {  \
+      std::string suffix = class_signature.substr(                  \
+        class_signature.size() - global_jtrace_receiver.size()      \
+        );                                                          \
+      if (suffix == global_jtrace_receiver) block;                  \
+    }                                                               \
+  }
+
+  CHECK_RECEIVER({
+      if (method_names[method] == "start")
+        global.trace_on = true;
+      if (method_names[method] == "end") {
+        global.trace_on = false;
+        global.receiver = 0;
+      }
+    });
+
+  if (!global.trace_on) return;
+
   if (method_local_variables.count(method) == 0) {
     jvmtiLocalVariableEntry *_var_table = NULL;
     jint _var_entry_count;
@@ -365,7 +393,16 @@ void JNICALL cb_single_step(
     error = jvmti->GetLocalInstance(thread, 0, &_this);
     check_jvmti_error(jvmti, error, "unable to get local instance");
     current_step.local_state["this"].value._object = _this;
+
+    CHECK_RECEIVER({
+        if (global.receiver == 0)
+          global.receiver = _this;
+      });
   }
+
+  CHECK_RECEIVER({
+      return;
+    });
 
   jfieldID *_field_table = NULL;
   jint _field_entry_count;
@@ -380,28 +417,22 @@ void JNICALL cb_single_step(
     read_field(jvmti, jni, current_step, klass, field);
 
   if (
-    global_program_steps.size() > 0
-    && global_program_steps.back() == current_step
+    global.program_steps.size() > 0
+    && global.program_steps.back() == current_step
     ) return;
-  global_program_steps.push_back(current_step);
+  global.program_steps.push_back(current_step);
+  write_step(jni, current_step);
 }
 
 void JNICALL cb_vm_start(jvmtiEnv *jvmti, JNIEnv *jni)
 {
-  std::cerr << "VM started" << std::endl;
-  global_jvm_started = true;
-}
-
-void JNICALL cb_vm_death(jvmtiEnv *jvmti, JNIEnv *jni)
-{
-  std::cerr << "VM died" << std::endl;
-  write_toml();
+  global.jvm_started = true;
 }
 
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
 {
-  jint res = jvm->GetEnv((void **)&global_jvmti, JVMTI_VERSION_1_0);
-  if (res != JNI_OK || global_jvmti == NULL) {
+  jint res = jvm->GetEnv((void **)&global.jvmti, JVMTI_VERSION_1_0);
+  if (res != JNI_OK || global.jvmti == NULL) {
     std::cerr << "unable to access JVMTI version 1.0" << std::endl;
     return JNI_ERR;
   }
@@ -415,31 +446,26 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   capa.can_get_source_file_name = 1;
   capa.can_access_local_variables = 1;
 
-  error = global_jvmti->AddCapabilities(&capa);
-  check_jvmti_error(global_jvmti, error, "unable to set necessary capabilities");
+  error = global.jvmti->AddCapabilities(&capa);
+  check_jvmti_error(global.jvmti, error, "unable to set necessary capabilities");
 
   jvmtiEventCallbacks callbacks;
   std::memset(&callbacks, 0, sizeof(callbacks));
 
   callbacks.SingleStep = cb_single_step;
   callbacks.VMStart = cb_vm_start;
-  callbacks.VMDeath = cb_vm_death;
 
-  error = global_jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
-  check_jvmti_error(global_jvmti, error, "unable to set event callbacks");
+  error = global.jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
+  check_jvmti_error(global.jvmti, error, "unable to set event callbacks");
 
-  error = global_jvmti->SetEventNotificationMode(
+  error = global.jvmti->SetEventNotificationMode(
     JVMTI_ENABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
     );
-  check_jvmti_error(global_jvmti, error, "unable to set event notification");
-  error = global_jvmti->SetEventNotificationMode(
+  check_jvmti_error(global.jvmti, error, "unable to set event notification");
+  error = global.jvmti->SetEventNotificationMode(
     JVMTI_ENABLE, JVMTI_EVENT_VM_START, (jthread) NULL
     );
-  check_jvmti_error(global_jvmti, error, "unable to set event notification");
-  error = global_jvmti->SetEventNotificationMode(
-    JVMTI_ENABLE, JVMTI_EVENT_VM_DEATH, (jthread) NULL
-    );
-  check_jvmti_error(global_jvmti, error, "unable to set event notification");
+  check_jvmti_error(global.jvmti, error, "unable to set event notification");
 
   return JNI_OK;
 }
