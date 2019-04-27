@@ -65,9 +65,8 @@ struct single_step
 struct global_state
 {
   bool jvm_started = false;
-  bool trace_on = false;
   jvmtiEnv *jvmti = NULL;
-  jobject receiver = 0;
+  jmethodID receiver_add_method = 0;
   std::vector<single_step> program_steps;
 };
 
@@ -149,9 +148,10 @@ void write_state(std::ostream& output, std::string prefix, state_map map)
   }
 }
 
-void write_step(JNIEnv *jni, const single_step& step)
+void write_step(JNIEnv *jni, jobject receiver, const single_step& step)
 {
-  if (global.receiver == 0) return;
+  if (receiver == 0 || global.receiver_add_method == 0)
+    return;
 
   std::ostringstream output;
   output
@@ -169,12 +169,7 @@ void write_step(JNIEnv *jni, const single_step& step)
   for (int i = 0; i < outstr.size(); ++i)
     output_chars[i] = (jchar)outstr[i];
   jstring output_string = jni->NewString(output_chars, (jsize)outstr.size());
-
-  jclass receiver_class = jni->GetObjectClass(global.receiver);
-  const char *add_method_name = "add";
-  const char *add_method_signature = "(Ljava/lang/String;)V";
-  jmethodID add_method = jni->GetMethodID(receiver_class, add_method_name, add_method_signature);
-  jni->CallVoidMethod(global.receiver, add_method, output_string);
+  jni->CallVoidMethod(receiver, global.receiver_add_method, output_string);
 }
 
 bool get_local_variable(
@@ -290,6 +285,9 @@ void read_field(
   else step.class_state[field_name] = field_value;
 }
 
+static std::unordered_map<jmethodID, std::string> method_classes;
+static std::unordered_map<jmethodID, std::string> method_names;
+
 void JNICALL cb_single_step(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
@@ -298,16 +296,19 @@ void JNICALL cb_single_step(
   jlocation location
   )
 {
-  if (!global.jvm_started) return;
-
-  static std::unordered_map<jmethodID, std::string> method_classes;
-  static std::unordered_map<jmethodID, std::string> method_names;
+  static std::unordered_map<jmethodID, bool> method_traceable;
+  static std::unordered_map<jmethodID, std::vector<jfieldID>> method_fields;
   static std::unordered_map<
     jmethodID,
     std::vector<jvmtiLocalVariableEntry>
     > method_local_variables;
-  jvmtiError error;
 
+  if (!global.jvm_started) return;
+
+  if (method_traceable.count(method) > 0 && !method_traceable[method])
+    return;
+
+  jvmtiError error;
   jclass klass;
   error = jvmti->GetMethodDeclaringClass(method, &klass);
   check_jvmti_error(jvmti, error, "unable to get class");
@@ -325,8 +326,21 @@ void JNICALL cb_single_step(
   std::string class_signature(method_classes[method]);
   for (const auto& prefix : global_java_prefixes) {
     const auto cmp_substr = class_signature.substr(0, prefix.size());
-    if (cmp_substr == prefix) return;
+    if (cmp_substr == prefix) {
+      method_traceable[method] = false;
+      return;
+    }
   }
+
+  if (class_signature.size() >= global_jtrace_receiver.size()) {
+    std::string suffix = class_signature.substr(
+      class_signature.size() - global_jtrace_receiver.size()
+      );
+    if (suffix == global_jtrace_receiver)
+      return;
+  }
+
+  method_traceable[method] = true;
 
   if (method_names.count(method) == 0) {
     char *_method_name = NULL;
@@ -342,30 +356,12 @@ void JNICALL cb_single_step(
     jvmti->Deallocate((unsigned char *)_method_generic);
   }
 
-#define CHECK_RECEIVER(block) {                                     \
-    if (class_signature.size() >= global_jtrace_receiver.size()) {  \
-      std::string suffix = class_signature.substr(                  \
-        class_signature.size() - global_jtrace_receiver.size()      \
-        );                                                          \
-      if (suffix == global_jtrace_receiver) block;                  \
-    }                                                               \
-  }
-
-  CHECK_RECEIVER({
-      if (method_names[method] == "start")
-        global.trace_on = true;
-      if (method_names[method] == "end") {
-        global.trace_on = false;
-        global.receiver = 0;
-      }
-    });
-
-  if (!global.trace_on) return;
-
   if (method_local_variables.count(method) == 0) {
     jvmtiLocalVariableEntry *_var_table = NULL;
     jint _var_entry_count;
-    error = jvmti->GetLocalVariableTable(method, &_var_entry_count, &_var_table);
+    error = jvmti->GetLocalVariableTable(
+      method, &_var_entry_count, &_var_table
+      );
     check_jvmti_error(jvmti, error, "unable to get local variable table");
     method_local_variables[method].assign(
       _var_table, _var_table + _var_entry_count
@@ -393,27 +389,20 @@ void JNICALL cb_single_step(
     error = jvmti->GetLocalInstance(thread, 0, &_this);
     check_jvmti_error(jvmti, error, "unable to get local instance");
     current_step.local_state["this"].value._object = _this;
-
-    CHECK_RECEIVER({
-        if (global.receiver == 0)
-          global.receiver = _this;
-      });
   }
 
-  CHECK_RECEIVER({
-      return;
-    });
+  if (method_fields.count(method) == 0) {
+    jfieldID *_field_table = NULL;
+    jint _field_entry_count;
+    error = jvmti->GetClassFields(klass, &_field_entry_count, &_field_table);
+    check_jvmti_error(jvmti, error, "unable to get class field");
+    method_fields[method].assign(
+      _field_table, _field_table + _field_entry_count
+      );
+    jvmti->Deallocate((unsigned char *)_field_table);
+  }
 
-  jfieldID *_field_table = NULL;
-  jint _field_entry_count;
-  error = jvmti->GetClassFields(klass, &_field_entry_count, &_field_table);
-  check_jvmti_error(jvmti, error, "unable to get class field");
-  std::vector<jfieldID> class_fields(
-    _field_table, _field_table + _field_entry_count
-    );
-  jvmti->Deallocate((unsigned char *)_field_table);
-
-  for (const auto& field : class_fields)
+  for (const auto& field : method_fields[method])
     read_field(jvmti, jni, current_step, klass, field);
 
   if (
@@ -421,7 +410,76 @@ void JNICALL cb_single_step(
     && global.program_steps.back() == current_step
     ) return;
   global.program_steps.push_back(current_step);
-  write_step(jni, current_step);
+}
+
+void JNICALL cb_method_enter(
+  jvmtiEnv *jvmti,
+  JNIEnv *jni,
+  jthread thread,
+  jmethodID method
+  )
+{
+  if (!global.jvm_started) return;
+
+  jvmtiError error;
+  jclass klass;
+  error = jvmti->GetMethodDeclaringClass(method, &klass);
+  check_jvmti_error(jvmti, error, "unable to get class");
+
+  if (method_classes.count(method) == 0) {
+    char *_class_signature = NULL;
+    char *_class_generic = NULL;
+    error = jvmti->GetClassSignature(klass, &_class_signature, &_class_generic);
+    check_jvmti_error(jvmti, error, "unable to get signature");
+    method_classes[method] = _class_signature;
+    jvmti->Deallocate((unsigned char *)_class_signature);
+    jvmti->Deallocate((unsigned char *)_class_generic);
+  }
+
+  std::string class_signature(method_classes[method]);
+  if (class_signature.size() < global_jtrace_receiver.size()) return;
+  if (
+    class_signature.substr(
+      class_signature.size() - global_jtrace_receiver.size()
+      ) != global_jtrace_receiver
+    ) return;
+
+  if (method_names.count(method) == 0) {
+    char *_method_name = NULL;
+    char *_method_signature = NULL;
+    char *_method_generic = NULL;
+    error = jvmti->GetMethodName(
+      method, &_method_name, &_method_signature, &_method_generic
+      );
+    check_jvmti_error(jvmti, error, "unable to get method name");
+    method_names[method] = _method_name;
+    jvmti->Deallocate((unsigned char *)_method_name);
+    jvmti->Deallocate((unsigned char *)_method_signature);
+    jvmti->Deallocate((unsigned char *)_method_generic);
+  }
+
+  if (method_names[method] == "start") {
+    jmethodID add_method = jni->GetMethodID(klass, "add", "(Ljava/lang/String;)V");
+    if (add_method) global.receiver_add_method = add_method;
+
+    error = jvmti->SetEventNotificationMode(
+      JVMTI_ENABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
+      );
+    check_jvmti_error(jvmti, error, "unable to set event notification");
+  } else if (method_names[method] == "end") {
+    error = jvmti->SetEventNotificationMode(
+      JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
+      );
+    check_jvmti_error(jvmti, error, "unable to set event notification");
+
+    jobject _this = 0;
+    error = jvmti->GetLocalInstance(thread, 0, &_this);
+    check_jvmti_error(jvmti, error, "unable to get local instance");
+    for (const auto& step : global.program_steps)
+      write_step(jni, _this, step);
+  }
+
+  return;
 }
 
 void JNICALL cb_vm_start(jvmtiEnv *jvmti, JNIEnv *jni)
@@ -442,6 +500,7 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   std::memset(&capa, 0, sizeof(capa));
 
   capa.can_generate_single_step_events = 1;
+  capa.can_generate_method_entry_events = 1;
   capa.can_get_line_numbers = 1;
   capa.can_get_source_file_name = 1;
   capa.can_access_local_variables = 1;
@@ -454,12 +513,13 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
 
   callbacks.SingleStep = cb_single_step;
   callbacks.VMStart = cb_vm_start;
+  callbacks.MethodEntry = cb_method_enter;
 
   error = global.jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
   check_jvmti_error(global.jvmti, error, "unable to set event callbacks");
 
   error = global.jvmti->SetEventNotificationMode(
-    JVMTI_ENABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
+    JVMTI_ENABLE, JVMTI_EVENT_METHOD_ENTRY, (jthread) NULL
     );
   check_jvmti_error(global.jvmti, error, "unable to set event notification");
   error = global.jvmti->SetEventNotificationMode(
