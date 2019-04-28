@@ -1,23 +1,36 @@
 
+// jtrace.cpp
+//
+// A native agent that traces Java code execution.
+//
+// author: Ajay Tatachar <ajaymt2@illinois.edu>
+
+// Useful documentation:
+// https://docs.oracle.com/javase/8/docs/platform/jvmti/jvmti.html
+// https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html
+
 #include <iostream>
 #include <sstream>
-#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <cstring>
-#include <cstdint>
 #include <cstdlib>
 #include <jvmti.h>
 #include <jni.h>
 
+// For now we don't trace code inside the Java stdlib, there will eventually be
+// a better way to ignore specific classes/packages.
 static const std::vector<std::string> global_java_prefixes = {
   "Ljava/",
   "Ljdk/",
   "Lsun/"
 };
+// Receiver class name
 static const std::string global_jtrace_receiver = "JTraceReceiver;";
 
+// Every Java value has a type and a signature. The value is stored as a
+// union of all underlying JVMTI types.
 struct java_value
 {
   enum java_type
@@ -51,8 +64,11 @@ struct java_value
   java_value() : type(INT) { std::memset(&value, 0, sizeof(value)); }
 };
 
+// State is captured as a map of identifiers to values.
 typedef std::unordered_map<std::string, java_value> state_map;
 
+// Every execution step is inside a method and has local, instance and class
+// state.
 struct single_step
 {
   std::string class_name;
@@ -62,16 +78,18 @@ struct single_step
   state_map local_state;
 };
 
+// Putting all the global variables in a single struct makes them seem
+// less bad.
 struct global_state
 {
   bool jvm_started = false;
-  jvmtiEnv *jvmti = NULL;
-  jmethodID receiver_add_method = 0;
+  jmethodID receiver_method = 0;
   std::vector<single_step> program_steps;
 };
-
 static global_state global;
 
+// We overload this operator to be able to tell whether state changed between
+// two steps.
 bool operator==(const single_step& left, const single_step& right)
 {
   if (left.class_name != right.class_name) return false;
@@ -104,6 +122,7 @@ bool operator==(const single_step& left, const single_step& right)
   return true;
 }
 
+// Exceptionally rudimentary error handling.
 void check_jvmti_error(
   jvmtiEnv *jvmti,
   jvmtiError errnum,
@@ -123,7 +142,8 @@ void check_jvmti_error(
   jvmti->Deallocate((unsigned char *)errnum_str);
 }
 
-void write_state(std::ostream& output, std::string prefix, state_map map)
+// Serialize a single state_map into TOML.
+void write_state(std::ostream& output, std::string prefix, const state_map& map)
 {
   for (const auto& var : map) {
     output
@@ -148,30 +168,41 @@ void write_state(std::ostream& output, std::string prefix, state_map map)
   }
 }
 
-void write_step(JNIEnv *jni, jobject receiver, const single_step& step)
+// Send the tracing information to the receiver.
+void send_steps(JNIEnv *jni, jobject receiver)
 {
-  if (receiver == 0 || global.receiver_add_method == 0)
+  if (receiver == 0 || global.receiver_method == 0)
     return;
 
   std::ostringstream output;
-  output
-    << "["
-    << "\"" << step.class_name << "\"."
-    << "\"" << step.method_name << "\""
-    << "]"
-    << std::endl;
-  write_state(output, "local", step.local_state);
-  write_state(output, "instance", step.instance_state);
-  write_state(output, "class", step.class_state);
+
+  for (int i = 0; i < global.program_steps.size(); ++i) {
+    const single_step& step = global.program_steps[i];
+    output
+      << "["
+      << "step" << i << "."
+      << "\"" << step.class_name << "\"."
+      << "\"" << step.method_name << "\""
+      << "]"
+      << std::endl;
+    write_state(output, "local", step.local_state);
+    write_state(output, "instance", step.instance_state);
+    write_state(output, "class", step.class_state);
+  }
 
   std::string outstr = output.str();
   jchar output_chars[outstr.size()];
   for (int i = 0; i < outstr.size(); ++i)
     output_chars[i] = (jchar)outstr[i];
   jstring output_string = jni->NewString(output_chars, (jsize)outstr.size());
-  jni->CallVoidMethod(receiver, global.receiver_add_method, output_string);
+  jni->CallVoidMethod(receiver, global.receiver_method, output_string);
 }
 
+// Read the value of a local variable.
+// Every variable exists in a specific `slot` (something like an offset)
+// within a stack frame.
+// `depth` is the depth of the stack frame -- `0` reads from the current
+// stack frame, `1` reads from the previous frame, etc.
 bool get_local_variable(
   jvmtiEnv *jvmti, jthread thread, int depth, int slot, java_value& value
   )
@@ -208,6 +239,7 @@ bool get_local_variable(
   return true;
 }
 
+// Read a field from an object or class.
 void read_field(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
@@ -216,6 +248,7 @@ void read_field(
   jfieldID field
   )
 {
+  // We know we're in an instance if `this` is bound locally.
   bool is_instance = step.local_state.count("this");
   jvmtiError error;
 
@@ -230,6 +263,7 @@ void read_field(
   std::string field_signature(_field_signature);
   jvmti->Deallocate((unsigned char *)_field_name);
   jvmti->Deallocate((unsigned char *)_field_signature);
+  jvmti->Deallocate((unsigned char *)_field_generic);
 
   jint _field_modifiers = 0;
   error = jvmti->GetFieldModifiers(klass, field, &_field_modifiers);
@@ -237,6 +271,7 @@ void read_field(
 
 #define FIELD_STATIC_MODIFIER 0x0008
 
+  // Don't do anything if it's an instance field and we're in a static context.
   bool is_static = _field_modifiers & FIELD_STATIC_MODIFIER;
   if (!is_static && !is_instance) return;
 
@@ -252,6 +287,7 @@ void read_field(
   }
 
   // yuck
+  // see: http://ftp.magicsoftware.com/www/help/mg9/How/howto_java_vm_type_signatures.htm
   if (field_signature == "I") {
     type = java_value::INT;
     READ_FIELD(jni->GetStaticIntField, jni->GetIntField, _int);
@@ -285,9 +321,12 @@ void read_field(
   else step.class_state[field_name] = field_value;
 }
 
+// Cache class and method names in the global scope because these are used by
+// more than one function.
 static std::unordered_map<jmethodID, std::string> method_classes;
 static std::unordered_map<jmethodID, std::string> method_names;
 
+// Single step callback that records state while tracing.
 void JNICALL cb_single_step(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
@@ -296,6 +335,7 @@ void JNICALL cb_single_step(
   jlocation location
   )
 {
+  // Cache field and local variable tables to not be slow.
   static std::unordered_map<jmethodID, bool> method_traceable;
   static std::unordered_map<jmethodID, std::vector<jfieldID>> method_fields;
   static std::unordered_map<
@@ -313,6 +353,7 @@ void JNICALL cb_single_step(
   error = jvmti->GetMethodDeclaringClass(method, &klass);
   check_jvmti_error(jvmti, error, "unable to get class");
 
+  // Cache class name.
   if (method_classes.count(method) == 0) {
     char *_class_signature = NULL;
     char *_class_generic = NULL;
@@ -323,6 +364,7 @@ void JNICALL cb_single_step(
     jvmti->Deallocate((unsigned char *)_class_generic);
   }
 
+  // Ignore classes within the Java stdlib.
   std::string class_signature(method_classes[method]);
   for (const auto& prefix : global_java_prefixes) {
     const auto cmp_substr = class_signature.substr(0, prefix.size());
@@ -332,6 +374,7 @@ void JNICALL cb_single_step(
     }
   }
 
+  // Ignore the receiver class.
   if (class_signature.size() >= global_jtrace_receiver.size()) {
     std::string suffix = class_signature.substr(
       class_signature.size() - global_jtrace_receiver.size()
@@ -342,6 +385,9 @@ void JNICALL cb_single_step(
 
   method_traceable[method] = true;
 
+  // Cache method name.
+  // TODO: include method signature because name does not uniquely
+  // identify methods.
   if (method_names.count(method) == 0) {
     char *_method_name = NULL;
     char *_method_signature = NULL;
@@ -356,6 +402,7 @@ void JNICALL cb_single_step(
     jvmti->Deallocate((unsigned char *)_method_generic);
   }
 
+  // Cache local variable table.
   if (method_local_variables.count(method) == 0) {
     jvmtiLocalVariableEntry *_var_table = NULL;
     jint _var_entry_count;
@@ -373,6 +420,7 @@ void JNICALL cb_single_step(
   current_step.class_name = class_signature;
   current_step.method_name = method_names[method];
 
+  // Read all local variables.
   for (const auto& var : method_local_variables[method]) {
     java_value var_value;
     var_value.signature = var.signature;
@@ -383,14 +431,15 @@ void JNICALL cb_single_step(
       current_step.local_state[std::string(var.name)] = var_value;
   }
 
+  // `this` does not behave like other local variables
   if (current_step.local_state.count("this")) {
-    // 'this' does not behave like other local variables
     jobject _this = 0;
     error = jvmti->GetLocalInstance(thread, 0, &_this);
     check_jvmti_error(jvmti, error, "unable to get local instance");
     current_step.local_state["this"].value._object = _this;
   }
 
+  // Cache field table.
   if (method_fields.count(method) == 0) {
     jfieldID *_field_table = NULL;
     jint _field_entry_count;
@@ -402,9 +451,12 @@ void JNICALL cb_single_step(
     jvmti->Deallocate((unsigned char *)_field_table);
   }
 
+  // Read all fields.
   for (const auto& field : method_fields[method])
     read_field(jvmti, jni, current_step, klass, field);
 
+  // Right now we aren't recording steps where the state doesn't change,
+  // though we probably should by default and have an option not to. TODO
   if (
     global.program_steps.size() > 0
     && global.program_steps.back() == current_step
@@ -412,6 +464,7 @@ void JNICALL cb_single_step(
   global.program_steps.push_back(current_step);
 }
 
+// Method entry callback that starts and stops the tracing.
 void JNICALL cb_method_enter(
   jvmtiEnv *jvmti,
   JNIEnv *jni,
@@ -426,6 +479,7 @@ void JNICALL cb_method_enter(
   error = jvmti->GetMethodDeclaringClass(method, &klass);
   check_jvmti_error(jvmti, error, "unable to get class");
 
+  // Cache class name.
   if (method_classes.count(method) == 0) {
     char *_class_signature = NULL;
     char *_class_generic = NULL;
@@ -436,6 +490,7 @@ void JNICALL cb_method_enter(
     jvmti->Deallocate((unsigned char *)_class_generic);
   }
 
+  // Ignore classes that aren't the receiver.
   std::string class_signature(method_classes[method]);
   if (class_signature.size() < global_jtrace_receiver.size()) return;
   if (
@@ -444,6 +499,7 @@ void JNICALL cb_method_enter(
       ) != global_jtrace_receiver
     ) return;
 
+  // Cache method name.
   if (method_names.count(method) == 0) {
     char *_method_name = NULL;
     char *_method_signature = NULL;
@@ -458,39 +514,46 @@ void JNICALL cb_method_enter(
     jvmti->Deallocate((unsigned char *)_method_generic);
   }
 
-  if (method_names[method] == "start") {
-    jmethodID add_method = jni->GetMethodID(klass, "add", "(Ljava/lang/String;)V");
-    if (add_method) global.receiver_add_method = add_method;
+  if (method_names[method] == "start") { // Start tracing.
+    jmethodID receive_method = jni->GetMethodID(
+      klass, "receive", "(Ljava/lang/String;)V"
+      );
+    if (receive_method)
+      global.receiver_method = receive_method;
 
     error = jvmti->SetEventNotificationMode(
       JVMTI_ENABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
       );
     check_jvmti_error(jvmti, error, "unable to set event notification");
-  } else if (method_names[method] == "end") {
+  } else if (method_names[method] == "end") { // Stop tracing.
     error = jvmti->SetEventNotificationMode(
       JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
       );
     check_jvmti_error(jvmti, error, "unable to set event notification");
 
+    // Send trace info to the receiver.
     jobject _this = 0;
     error = jvmti->GetLocalInstance(thread, 0, &_this);
     check_jvmti_error(jvmti, error, "unable to get local instance");
-    for (const auto& step : global.program_steps)
-      write_step(jni, _this, step);
+    send_steps(jni, _this);
   }
 
   return;
 }
 
+// VM start callback.
 void JNICALL cb_vm_start(jvmtiEnv *jvmti, JNIEnv *jni)
 {
   global.jvm_started = true;
 }
 
+// 'OnLoad' callback that initializes everything.
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
 {
-  jint res = jvm->GetEnv((void **)&global.jvmti, JVMTI_VERSION_1_0);
-  if (res != JNI_OK || global.jvmti == NULL) {
+  jvmtiEnv *jvmti = NULL;
+
+  jint res = jvm->GetEnv((void **)&jvmti, JVMTI_VERSION_1_0);
+  if (res != JNI_OK || jvmti == NULL) {
     std::cerr << "unable to access JVMTI version 1.0" << std::endl;
     return JNI_ERR;
   }
@@ -505,8 +568,10 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   capa.can_get_source_file_name = 1;
   capa.can_access_local_variables = 1;
 
-  error = global.jvmti->AddCapabilities(&capa);
-  check_jvmti_error(global.jvmti, error, "unable to set necessary capabilities");
+  error = jvmti->AddCapabilities(&capa);
+  check_jvmti_error(
+    jvmti, error, "unable to set necessary capabilities"
+    );
 
   jvmtiEventCallbacks callbacks;
   std::memset(&callbacks, 0, sizeof(callbacks));
@@ -515,17 +580,17 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
   callbacks.VMStart = cb_vm_start;
   callbacks.MethodEntry = cb_method_enter;
 
-  error = global.jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
-  check_jvmti_error(global.jvmti, error, "unable to set event callbacks");
+  error = jvmti->SetEventCallbacks(&callbacks, (jint) sizeof(callbacks));
+  check_jvmti_error(jvmti, error, "unable to set event callbacks");
 
-  error = global.jvmti->SetEventNotificationMode(
+  error = jvmti->SetEventNotificationMode(
     JVMTI_ENABLE, JVMTI_EVENT_METHOD_ENTRY, (jthread) NULL
     );
-  check_jvmti_error(global.jvmti, error, "unable to set event notification");
-  error = global.jvmti->SetEventNotificationMode(
+  check_jvmti_error(jvmti, error, "unable to set event notification");
+  error = jvmti->SetEventNotificationMode(
     JVMTI_ENABLE, JVMTI_EVENT_VM_START, (jthread) NULL
     );
-  check_jvmti_error(global.jvmti, error, "unable to set event notification");
+  check_jvmti_error(jvmti, error, "unable to set event notification");
 
   return JNI_OK;
 }

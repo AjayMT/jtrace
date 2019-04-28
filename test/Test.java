@@ -12,11 +12,21 @@ public class Test {
         }
     }
 
+    static class JTraceReceiver {
+        public void start() {}
+        public void end() {}
+        public void receive(String info) {
+            System.out.println("Trace info:\n" + info);
+        }
+    }
+
     public static void main(String[] args) {
         int f = 12;
         int local = 42;
         staticState = !staticState;
 
+        JTraceReceiver tracer = new JTraceReceiver();
+        tracer.start();
         MyClass myObject = new MyClass();
         myObject.printSelf();
 
@@ -25,5 +35,6 @@ public class Test {
             System.out.println(a);
             myObject = null;
         }
+        tracer.end();
     }
 }
