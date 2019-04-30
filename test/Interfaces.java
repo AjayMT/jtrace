@@ -7,17 +7,17 @@ class Interfaces {
     }
 
     static class JTraceReceiver {
-        void start() {}
-        void end() {}
-        void receive(String s) { System.out.println(s); }
+        static boolean filterSteps = true;
+        static void start() {}
+        static void end() {}
+        static void receive(String s, int n) { System.out.println(s); }
     }
 
     public static void main(String[] args) {
-        JTraceReceiver tracer = new JTraceReceiver();
-        tracer.start();
+        JTraceReceiver.start();
         Comparable sub = new Sandwich();
         Comparable blt = new Sandwich();
         System.out.println(sub.compareTo(blt));
-        tracer.end();
+        JTraceReceiver.end();
     }
 }

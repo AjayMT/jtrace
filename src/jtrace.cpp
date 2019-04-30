@@ -28,6 +28,8 @@ static const std::vector<std::string> global_java_prefixes = {
 };
 // Receiver class name
 static const std::string global_jtrace_receiver = "JTraceReceiver;";
+// Receiver method signature
+static const std::string global_receive_signature = "(Ljava/lang/String;I)V";
 
 // Every Java value has a type and a signature. The value is stored as a
 // union of all underlying JVMTI types.
@@ -83,6 +85,7 @@ struct single_step
 struct global_state
 {
   bool jvm_started = false;
+  bool state_only = false;
   jmethodID receiver_method = 0;
   std::vector<single_step> program_steps;
 };
@@ -169,7 +172,7 @@ void write_state(std::ostream& output, std::string prefix, const state_map& map)
 }
 
 // Send the tracing information to the receiver.
-void send_steps(JNIEnv *jni, jobject receiver)
+void send_steps(JNIEnv *jni, jclass receiver)
 {
   if (receiver == 0 || global.receiver_method == 0)
     return;
@@ -195,7 +198,12 @@ void send_steps(JNIEnv *jni, jobject receiver)
   for (int i = 0; i < outstr.size(); ++i)
     output_chars[i] = (jchar)outstr[i];
   jstring output_string = jni->NewString(output_chars, (jsize)outstr.size());
-  jni->CallVoidMethod(receiver, global.receiver_method, output_string);
+  jni->CallStaticVoidMethod(
+    receiver,
+    global.receiver_method,
+    output_string,
+    (jint)global.program_steps.size()
+    );
 }
 
 // Read the value of a local variable.
@@ -379,8 +387,10 @@ void JNICALL cb_single_step(
     std::string suffix = class_signature.substr(
       class_signature.size() - global_jtrace_receiver.size()
       );
-    if (suffix == global_jtrace_receiver)
+    if (suffix == global_jtrace_receiver) {
+      method_traceable[method] = false;
       return;
+    }
   }
 
   method_traceable[method] = true;
@@ -455,10 +465,11 @@ void JNICALL cb_single_step(
   for (const auto& field : method_fields[method])
     read_field(jvmti, jni, current_step, klass, field);
 
-  // Right now we aren't recording steps where the state doesn't change,
-  // though we probably should by default and have an option not to. TODO
+  // If the receiver wants only state changes, we exclude steps that
+  // don't change state.
   if (
-    global.program_steps.size() > 0
+    global.state_only
+    && global.program_steps.size() > 0
     && global.program_steps.back() == current_step
     ) return;
   global.program_steps.push_back(current_step);
@@ -515,27 +526,41 @@ void JNICALL cb_method_enter(
   }
 
   if (method_names[method] == "start") { // Start tracing.
-    jmethodID receive_method = jni->GetMethodID(
-      klass, "receive", "(Ljava/lang/String;)V"
-      );
-    if (receive_method)
+    if (global.receiver_method == 0) {
+      jmethodID receive_method = jni->GetStaticMethodID(
+        klass, "receive", global_receive_signature.data()
+        );
       global.receiver_method = receive_method;
+    }
 
+    // Cache the "filterSteps" field.
+    static jfieldID state_only_field = 0;
+    if (state_only_field == 0)
+      state_only_field = jni->GetStaticFieldID(klass, "stateOnly", "Z");
+
+    // Check if the receiver wants to filter recorded steps.
+    if (state_only_field)
+      global.state_only = (bool)jni->GetStaticBooleanField(
+        klass, state_only_field
+        );
+
+    // Enable VM single-step notifications.
     error = jvmti->SetEventNotificationMode(
       JVMTI_ENABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
       );
     check_jvmti_error(jvmti, error, "unable to set event notification");
   } else if (method_names[method] == "end") { // Stop tracing.
+    // Disable VM single-step notifications.
     error = jvmti->SetEventNotificationMode(
       JVMTI_DISABLE, JVMTI_EVENT_SINGLE_STEP, (jthread) NULL
       );
     check_jvmti_error(jvmti, error, "unable to set event notification");
 
     // Send trace info to the receiver.
-    jobject _this = 0;
-    error = jvmti->GetLocalInstance(thread, 0, &_this);
-    check_jvmti_error(jvmti, error, "unable to get local instance");
-    send_steps(jni, _this);
+    send_steps(jni, klass);
+
+    // clear program steps
+    global.program_steps.clear();
   }
 
   return;

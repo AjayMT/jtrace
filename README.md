@@ -10,21 +10,29 @@ make # this will produce a `jtrace` shared library file
 ```
 
 ## Usage
-The `jtrace` shared library is a [native agent](https://www.oracle.com/technetwork/articles/javase/index-140680.html) that interacts with the tracee through an instance of `JTraceReceiver` that implements the following interface:
+The `jtrace` shared library is a [native agent](https://www.oracle.com/technetwork/articles/javase/index-140680.html) that interacts with the tracee through a `JTraceReceiver` class that implements the following interface:
 ```java
 class JTraceReceiver {
+    /** Whether to record state changes only. */
+    static boolean stateOnly;
+
     /** Begin tracing. */
-    public void start() {
+    static void start() {
         // pre-trace stuff...
     }
 
     /** End tracing. */
-    public void end() {
+    static void end() {
         // post-trace stuff...
     }
 
-    /** Receive trace results. */
-    public void receive(String result) {
+    /** 
+     * Receive trace results.
+     *
+     * @param result Tracing results serialized into TOML.
+     * @param stepCount The number of execution steps recorded.
+     */
+    static void receive(String result, int stepCount) {
         // process trace results...
     }
 
@@ -36,18 +44,19 @@ For example:
 ```java
 class Test {
     class JTraceReceiver {
-        public void start() {}
-        public void end() {}
-        public void receive(String s) {
+        static boolean stateOnly;
+        static void start() {}
+        static void end() {}
+        static void receive(String s) {
             System.out.println(s);
         }
     }
 
     public static void main(String[] args) {
-        JTraceReceiver tracer = new JTraceReceiver();
-        tracer.start(); // tracing begins here
+        JTraceReceiver.stateOnly = true; // only record steps that change state
+        JTraceReceiver.start(); // tracing begins here
         for (int i = 0; i < 10; ++i);
-        tracer.end(); // tracing ends here
+        JTraceReceiver.end(); // tracing ends here
     }
 }
 ```
@@ -66,6 +75,5 @@ java -agentpath:<PATH TO JTRACE> Example
 
 ### TODOs
 - `jtrace` does not trace code inside standard library classes. Which classes/namespaces to ignore should be a part of the `JTraceReceiver` interface.
-- `jtrace` only records program state when it changes. Execution steps that do not change the program's state are ignored. Whether or not to do this should also be specified by the receiver.
 - `jtrace` does not produce trace output during tracing -- all of the output is sent to the receiver when tracing ends. This is for a number of reasons, but mostly because it is non-trivial to keep track of the receiver object as the JVM moves it all over the heap.
 - String of TOML is a suboptimal way to send results.
