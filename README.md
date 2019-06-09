@@ -47,7 +47,7 @@ class Test {
         static boolean stateOnly;
         static void start() {}
         static void end() {}
-        static void receive(String s) {
+        static void receive(String s, int n) {
             System.out.println(s);
         }
     }
@@ -72,6 +72,8 @@ java -agentpath:<PATH TO JTRACE> Example
 ```
 
 `jtrace` records **local**, **instance** (if applicable) and **class** state at every execution step and serializes output into [TOML](https://github.com/toml-lang/toml) before sending it to the receiver.
+
+`jtrace` also more-or-less works with Kotlin: see [jtrace-kotlin-example](http://github.com/AjayMT/jtrace-kotlin-example).
 
 ### TODOs
 - `jtrace` does not trace code inside standard library classes. Which classes/namespaces to ignore should be a part of the `JTraceReceiver` interface.
